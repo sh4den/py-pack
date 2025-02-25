@@ -2,7 +2,7 @@ import os
 import ast
 from pathlib import Path
 import re
-from typing import Dict, Set, List
+from typing import Dict, Optional, Set, List
 import json
 import hashlib
 import time
@@ -158,56 +158,66 @@ class Packer:
             Tuple[Path, str]: Tuple of (chunk output path, hashed filename)
         """
         chunk_code = []
-        processed_imports = set()
+        import_tracker = {
+            "standard": set(),
+            "relative": set(),
+            "third_party": set(),
+        }
 
         chunk_code.append(f"# Chunk: {chunk_name}")
-
-        loader_code = """
-        def load_chunk(chunk_name):
-            import importlib.util
-            import sys
-            import json
-            import os
-    
-            # Load manifest to get actual chunk file
-            manifest_path = os.path.join(os.path.dirname(__file__), 'manifest.json')
-            with open(manifest_path, 'r') as f:
-                manifest = json.load(f)
-    
-            chunk_file = manifest['fileMap'][chunk_name + '.py']
-            spec = importlib.util.spec_from_file_location(chunk_name, chunk_file)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[chunk_name] = module
-            spec.loader.exec_module(module)
-            return module
-        """
-        chunk_code.append(loader_code.strip())
+        chunk_code.append(self._get_loader_code())
 
         for module in modules:
             if module in self.sorted_modules:
                 with open(module, "r") as f:
                     content = f.read()
+                    tree = ast.parse(content)
 
+                    for node in ast.walk(tree):
+                        if isinstance(node, ast.Import):
+                            for name in node.names:
+                                import_line = f"import {name.name}"
+                                if name.asname:
+                                    import_line += f" as {name.asname}"
+                                if self._is_stdlib_module(name.name):
+                                    import_tracker["standard"].add(import_line)
+                                else:
+                                    import_tracker["third_party"].add(import_line)
+
+                        elif isinstance(node, ast.ImportFrom):
+                            if node.level > 0:
+                                module_path = self._resolve_relative_import(
+                                    module, node
+                                )
+                                if module_path and module_path in modules:
+                                    continue
+                                import_line = self._format_relative_import(node)
+                                import_tracker["relative"].add(import_line)
+                            else:
+                                import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
+                                if self._is_stdlib_module(node.module):
+                                    import_tracker["standard"].add(import_line)
+                                else:
+                                    import_tracker["third_party"].add(import_line)
+
+        chunk_code.extend(sorted(import_tracker["standard"]))
+        chunk_code.extend(sorted(import_tracker["third_party"]))
+        chunk_code.extend(sorted(import_tracker["relative"]))
+
+        for module in modules:
+            if module in self.sorted_modules:
+                with open(module, "r") as f:
+                    content = f.read()
                     lines = content.split("\n")
                     filtered_lines = []
 
                     for line in lines:
-                        if not line.strip():
-                            filtered_lines.append(line)
-                            continue
-
-                        if line.strip().startswith(("import ", "from ", "from.")):
-                            if any(str(m.parent) in line for m in modules):
-                                continue
-
-                            if line not in processed_imports:
-                                processed_imports.add(line)
-                                filtered_lines.append(line)
-                        else:
+                        if not line.strip() or not line.strip().startswith(
+                            ("import ", "from ")
+                        ):
                             filtered_lines.append(line)
 
                     module_content = "\n".join(filtered_lines)
-
                     chunk_code.append(f"\n# Module: {module.name}")
 
                     try:
@@ -218,7 +228,6 @@ class Packer:
                         chunk_code.append(module_content)
 
         chunk_content = "\n\n".join(chunk_code)
-
         chunk_hash = self.generate_chunk_hash(chunk_content)
         hashed_filename = f"{chunk_name}.{chunk_hash}.py"
         output_path = self.output_dir / hashed_filename
@@ -229,6 +238,43 @@ class Packer:
             f.write(self.minifier.minify(chunk_content))
 
         return output_path, hashed_filename
+
+    def _is_stdlib_module(self, module_name: str) -> bool:
+        """Check if a module is from the Python standard library."""
+        import sys
+        import importlib.util
+
+        base_module = module_name.split(".")[0]
+
+        if base_module in sys.builtin_module_names:
+            return True
+
+        spec = importlib.util.find_spec(base_module)
+        if spec is None:
+            return False
+
+        return "site-packages" not in str(spec.origin or "")
+
+    def _resolve_relative_import(
+        self, current_module: Path, import_node: ast.ImportFrom
+    ) -> Optional[Path]:
+        """Resolve a relative import to its absolute path."""
+        current_path = current_module.parent
+        for _ in range(import_node.level - 1):
+            current_path = current_path.parent
+
+        if import_node.module:
+            return current_path / f"{import_node.module.replace('.', '/')}.py"
+        return current_path / "__init__.py"
+
+    def _format_relative_import(self, node: ast.ImportFrom) -> str:
+        """Format a relative import statement."""
+        dots = "." * node.level
+        module = f"{dots}{node.module if node.module else ''}"
+        names = ", ".join(
+            n.name + (f" as {n.asname}" if n.asname else "") for n in node.names
+        )
+        return f"from {module} import {names}"
 
     def generate_chunk_manifest(self):
         """
@@ -379,7 +425,7 @@ class Packer:
         for dir_name, modules in dir_groups.items():
             if len(modules) >= min_chunk_size:
                 chunk_config = ChunkConfig(
-                    name=f"chunk_{dir_name}",
+                    name="chunk",
                     entry_points=[next(iter(modules))],
                     includes=[rf".*/{dir_name}/.*\.py"],
                 )
@@ -453,6 +499,25 @@ class Packer:
 
         return groups
 
+    def _get_loader_code(self) -> str:
+        """
+        Return the code for the chunk loader.
+        """
+        return """
+def __load_chunk__(name):
+    import importlib.util
+    import sys
+    import os
+    if name in sys.modules:
+        return sys.modules[name]
+    chunk_path = os.path.join(os.path.dirname(__file__), f"{{name}}.py")
+    spec = importlib.util.spec_from_file_location(name, chunk_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+    """
+
     def pack(self):
         """
         Execute the complete packing process with auto-generated chunks if none configured.
@@ -477,13 +542,12 @@ class Packer:
         for chunk_name, modules in self.chunks.items():
             chunk_path, hashed_filename = self.build_chunk(chunk_name, modules)
             self.chunk_hashes[chunk_name] = hashed_filename.split(".")[1]
-            size = os.path.getsize(chunk_path) / 1024  # Size in KB
+            size = os.path.getsize(chunk_path) / 1024
             total_size += size
             chunk_info.append((chunk_name, hashed_filename, size))
 
         self.generate_chunk_manifest()
 
-        # Build summary
         build_time = time.time() - start_time
         print(colored("\n✨ Build completed successfully!", "green"))
         print(colored("\nOutput files:", "white", attrs=["bold"]))
