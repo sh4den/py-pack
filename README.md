@@ -2,6 +2,9 @@
 
 A webpack-like bundler for Python that splits code into optimized chunks.
 
+![image](https://github.com/user-attachments/assets/0598d4c8-88a6-4c68-8b59-a8e0c4f48454)
+
+
 ## Features
 
 -   📦 Code splitting into multiple chunks
