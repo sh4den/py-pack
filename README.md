@@ -10,6 +10,7 @@ A webpack-like bundler for Python that splits code into optimized chunks.
 -   🔄 Dynamic chunk loading
 -   📊 Smart module assignment based on dependencies
 -   ⚡ Webpack-like configuration
+-   📜 Regex-based file matching
 
 ## Installation
 
