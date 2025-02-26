@@ -15,14 +15,16 @@ class ChunkBuilder:
     and manifest generation.
     """
 
-    def __init__(self, output_dir: str):
+    def __init__(self, output_dir: str, project_root: str = None):
         """
         Initialize a new ChunkBuilder instance.
 
         Args:
             output_dir (str): Directory where bundled chunks will be output
+            project_root (str, optional): Root directory of the project for resolving internal imports
         """
         self.output_dir = Path(output_dir)
+        self.project_root = Path(project_root) if project_root else Path.cwd()
         self.minifier = Minifier()
         self.chunk_hashes = {}
 
@@ -69,6 +71,41 @@ class ChunkBuilder:
             return False
 
         return "site-packages" not in str(spec.origin or "")
+
+    def _is_internal_module(self, module_name: str, current_module: Path) -> bool:
+        """
+        Check if a module is internal to the project.
+
+        Args:
+            module_name (str): The module name to check
+            current_module (Path): Path of the current module being processed
+
+        Returns:
+            bool: True if the module is internal to the project
+        """
+
+        module_path = self.project_root / Path(module_name.replace(".", "/") + ".py")
+        if module_path.exists():
+            return True
+
+        package_init = (
+            self.project_root / Path(module_name.replace(".", "/")) / "__init__.py"
+        )
+        if package_init.exists():
+            return True
+
+        module_dir = current_module.parent
+        relative_module_path = module_dir / Path(module_name.replace(".", "/") + ".py")
+        if relative_module_path.exists():
+            return True
+
+        relative_package_init = (
+            module_dir / Path(module_name.replace(".", "/")) / "__init__.py"
+        )
+        if relative_package_init.exists():
+            return True
+
+        return False
 
     def _resolve_relative_import(
         self, current_module: Path, import_node: ast.ImportFrom
@@ -123,7 +160,14 @@ def __load_chunk__(name):
 
         Returns:
             Tuple[Path, str]: Tuple of (chunk output path, hashed filename)
+            Returns (None, None) if the chunk would be empty or contains no meaningful content
         """
+        # Skip empty chunks
+        modules_in_sorted = [m for m in modules if m in sorted_modules]
+        if not modules_in_sorted:
+            print(f"Skipping empty chunk: {chunk_name}")
+            return None, None
+
         chunk_code = []
         import_tracker = {
             "standard": set(),
@@ -134,6 +178,7 @@ def __load_chunk__(name):
         chunk_code.append(f"# Chunk: {chunk_name}")
         chunk_code.append(self._get_loader_code())
 
+        # Collect all imports from the chunk's modules
         for module in modules:
             if module in sorted_modules:
                 with open(module, "r") as f:
@@ -148,7 +193,8 @@ def __load_chunk__(name):
                                     import_line += f" as {name.asname}"
                                 if self._is_stdlib_module(name.name):
                                     import_tracker["standard"].add(import_line)
-                                else:
+                                elif not self._is_internal_module(name.name, module):
+                                    # Only keep non-internal imports
                                     import_tracker["third_party"].add(import_line)
 
                         elif isinstance(node, ast.ImportFrom):
@@ -161,16 +207,20 @@ def __load_chunk__(name):
                                 import_line = self._format_relative_import(node)
                                 import_tracker["relative"].add(import_line)
                             else:
-                                import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
                                 if self._is_stdlib_module(node.module):
+                                    import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
                                     import_tracker["standard"].add(import_line)
-                                else:
+                                elif not self._is_internal_module(node.module, module):
+                                    # Only keep non-internal imports
+                                    import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
                                     import_tracker["third_party"].add(import_line)
 
         chunk_code.extend(sorted(import_tracker["standard"]))
         chunk_code.extend(sorted(import_tracker["third_party"]))
         chunk_code.extend(sorted(import_tracker["relative"]))
 
+        # Process module content
+        has_meaningful_content = False
         for module in modules:
             if module in sorted_modules:
                 with open(module, "r") as f:
@@ -185,6 +235,11 @@ def __load_chunk__(name):
                             filtered_lines.append(line)
 
                     module_content = "\n".join(filtered_lines)
+
+                    # Check if module has any meaningful content after removing imports
+                    if module_content.strip():
+                        has_meaningful_content = True
+
                     chunk_code.append(f"\n# Module: {module.name}")
 
                     try:
@@ -193,6 +248,11 @@ def __load_chunk__(name):
                     except Exception as e:
                         print(f"Error processing module {module}: {e}")
                         chunk_code.append(module_content)
+
+        # Skip the chunk if it doesn't have any meaningful content beyond imports
+        if not has_meaningful_content:
+            print(f"Skipping chunk {chunk_name} with no meaningful content")
+            return None, None
 
         chunk_content = "\n\n".join(chunk_code)
         chunk_hash = self.generate_chunk_hash(chunk_content)

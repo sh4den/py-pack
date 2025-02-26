@@ -325,18 +325,34 @@ class Packer:
         chunk_info = []
         total_size = 0
         chunk_dependencies = {}
+        valid_chunks = {}
 
         for chunk_name, modules in self.chunks.items():
             chunk_dependencies[chunk_name] = self.get_chunk_imports(chunk_name)
             chunk_path, hashed_filename = self.chunk_builder.build_chunk(
                 chunk_name, modules, self.sorted_modules
             )
+
+            if chunk_path is None:
+                # Skip chunks that weren't created
+                continue
+
+            valid_chunks[chunk_name] = modules
             size = os.path.getsize(chunk_path) / 1024
             total_size += size
             chunk_info.append((chunk_name, hashed_filename, size))
 
+        # Update chunk dependencies to only include valid chunks
+        valid_chunk_dependencies = {}
+        for chunk_name in valid_chunks:
+            valid_chunk_dependencies[chunk_name] = {
+                dep
+                for dep in chunk_dependencies.get(chunk_name, set())
+                if dep in valid_chunks
+            }
+
         self.chunk_builder.generate_chunk_manifest(
-            self.chunks, self.module_to_chunk, chunk_dependencies
+            valid_chunks, self.module_to_chunk, valid_chunk_dependencies
         )
 
         build_time = time.time() - start_time
