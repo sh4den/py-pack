@@ -326,11 +326,20 @@ class Packer:
         total_size = 0
         chunk_dependencies = {}
         valid_chunks = {}
+        processed_modules = set()
 
-        for chunk_name, modules in self.chunks.items():
+        chunk_processing_order = ["main"] + [
+            name for name in self.chunks.keys() if name != "main"
+        ]
+
+        for chunk_name in chunk_processing_order:
+            if chunk_name not in self.chunks:
+                continue
+
+            modules = self.chunks[chunk_name]
             chunk_dependencies[chunk_name] = self.get_chunk_imports(chunk_name)
             chunk_path, hashed_filename = self.chunk_builder.build_chunk(
-                chunk_name, modules, self.sorted_modules
+                chunk_name, modules, self.sorted_modules, self.module_to_chunk
             )
 
             if chunk_path is None:
@@ -338,6 +347,9 @@ class Packer:
                 continue
 
             valid_chunks[chunk_name] = modules
+            # Track which modules have been processed
+            processed_modules.update(modules)
+
             size = os.path.getsize(chunk_path) / 1024
             total_size += size
             chunk_info.append((chunk_name, hashed_filename, size))

@@ -148,7 +148,11 @@ def __load_chunk__(name):
     """
 
     def build_chunk(
-        self, chunk_name: str, modules: Set[Path], sorted_modules: List[Path]
+        self,
+        chunk_name: str,
+        modules: Set[Path],
+        sorted_modules: List[Path],
+        module_to_chunk: Dict[Path, str],
     ) -> Tuple[Path, str]:
         """
         Build a chunk file containing multiple module contents.
@@ -157,16 +161,38 @@ def __load_chunk__(name):
             chunk_name (str): Name of the chunk
             modules (Set[Path]): Set of module paths to include in the chunk
             sorted_modules (List[Path]): Topologically sorted modules
+            module_to_chunk (Dict[Path, str]): Mapping of modules to their chunks
 
         Returns:
             Tuple[Path, str]: Tuple of (chunk output path, hashed filename)
             Returns (None, None) if the chunk would be empty or contains no meaningful content
         """
-        # Skip empty chunks
         modules_in_sorted = [m for m in modules if m in sorted_modules]
         if not modules_in_sorted:
             print(f"Skipping empty chunk: {chunk_name}")
             return None, None
+
+        if chunk_name != "main":
+            modules_in_other_chunks = []
+            for module in modules_in_sorted:
+                assigned_chunk = module_to_chunk.get(module)
+                if (
+                    assigned_chunk
+                    and assigned_chunk != chunk_name
+                    and assigned_chunk == "main"
+                ):
+                    modules_in_other_chunks.append(module)
+
+            for module in modules_in_other_chunks:
+                if module in modules:
+                    modules.remove(module)
+
+            modules_in_sorted = [m for m in modules if m in sorted_modules]
+            if not modules_in_sorted:
+                print(
+                    f"Skipping redundant chunk: {chunk_name} (all modules already in other chunks)"
+                )
+                return None, None
 
         chunk_code = []
         import_tracker = {
@@ -178,7 +204,6 @@ def __load_chunk__(name):
         chunk_code.append(f"# Chunk: {chunk_name}")
         chunk_code.append(self._get_loader_code())
 
-        # Collect all imports from the chunk's modules
         for module in modules:
             if module in sorted_modules:
                 with open(module, "r") as f:
@@ -194,7 +219,6 @@ def __load_chunk__(name):
                                 if self._is_stdlib_module(name.name):
                                     import_tracker["standard"].add(import_line)
                                 elif not self._is_internal_module(name.name, module):
-                                    # Only keep non-internal imports
                                     import_tracker["third_party"].add(import_line)
 
                         elif isinstance(node, ast.ImportFrom):
@@ -219,7 +243,6 @@ def __load_chunk__(name):
         chunk_code.extend(sorted(import_tracker["third_party"]))
         chunk_code.extend(sorted(import_tracker["relative"]))
 
-        # Process module content
         has_meaningful_content = False
         for module in modules:
             if module in sorted_modules:
@@ -236,7 +259,6 @@ def __load_chunk__(name):
 
                     module_content = "\n".join(filtered_lines)
 
-                    # Check if module has any meaningful content after removing imports
                     if module_content.strip():
                         has_meaningful_content = True
 
@@ -249,7 +271,6 @@ def __load_chunk__(name):
                         print(f"Error processing module {module}: {e}")
                         chunk_code.append(module_content)
 
-        # Skip the chunk if it doesn't have any meaningful content beyond imports
         if not has_meaningful_content:
             print(f"Skipping chunk {chunk_name} with no meaningful content")
             return None, None
