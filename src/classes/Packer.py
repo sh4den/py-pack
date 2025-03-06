@@ -322,15 +322,18 @@ class Packer:
         self.topological_sort()
         self.assign_modules_to_chunks()
 
+        self.chunk_builder.processed_files = self.processed_files
+
         chunk_info = []
         total_size = 0
         chunk_dependencies = {}
         valid_chunks = {}
         processed_modules = set()
 
-        chunk_processing_order = ["main"] + [
-            name for name in self.chunks.keys() if name != "main"
-        ]
+        chunk_processing_order = [name for name in self.chunks.keys() if name != "main"]
+
+        if "main" in self.chunks:
+            chunk_processing_order.append("main")
 
         for chunk_name in chunk_processing_order:
             if chunk_name not in self.chunks:
@@ -343,18 +346,15 @@ class Packer:
             )
 
             if chunk_path is None:
-                # Skip chunks that weren't created
                 continue
 
             valid_chunks[chunk_name] = modules
-            # Track which modules have been processed
             processed_modules.update(modules)
 
             size = os.path.getsize(chunk_path) / 1024
             total_size += size
             chunk_info.append((chunk_name, hashed_filename, size))
 
-        # Update chunk dependencies to only include valid chunks
         valid_chunk_dependencies = {}
         for chunk_name in valid_chunks:
             valid_chunk_dependencies[chunk_name] = {

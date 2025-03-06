@@ -27,6 +27,7 @@ class ChunkBuilder:
         self.project_root = Path(project_root) if project_root else Path.cwd()
         self.minifier = Minifier()
         self.chunk_hashes = {}
+        self.processed_files = set()
 
     def generate_chunk_hash(self, content: str) -> str:
         """
@@ -199,10 +200,19 @@ def __load_chunk__(name):
             "standard": set(),
             "relative": set(),
             "third_party": set(),
+            "chunk_imports": set(),
         }
 
         chunk_code.append(f"# Chunk: {chunk_name}")
-        chunk_code.append(self._get_loader_code())
+
+        if chunk_name == "main":
+            chunk_code.append(self._get_loader_code())
+
+            for mod in self.processed_files:
+                if mod in module_to_chunk and module_to_chunk[mod] != "main":
+                    chunk_module = module_to_chunk[mod]
+                    print("test", module_to_chunk)
+                    import_tracker["chunk_imports"].add(f"{chunk_module}")
 
         for module in modules:
             if module in sorted_modules:
@@ -235,13 +245,20 @@ def __load_chunk__(name):
                                     import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
                                     import_tracker["standard"].add(import_line)
                                 elif not self._is_internal_module(node.module, module):
-                                    # Only keep non-internal imports
                                     import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
                                     import_tracker["third_party"].add(import_line)
 
         chunk_code.extend(sorted(import_tracker["standard"]))
         chunk_code.extend(sorted(import_tracker["third_party"]))
         chunk_code.extend(sorted(import_tracker["relative"]))
+
+        if chunk_name == "main" and import_tracker["chunk_imports"]:
+            for chunk_import in sorted(import_tracker["chunk_imports"]):
+                chunk_hash = self.chunk_hashes.get(chunk_import)
+                if chunk_hash:
+                    chunk_code.append(f"__load_chunk__('{chunk_import}.{chunk_hash}')")
+                else:
+                    chunk_code.append(f"__load_chunk__('{chunk_import}')")
 
         has_meaningful_content = False
         for module in modules:
@@ -250,12 +267,29 @@ def __load_chunk__(name):
                     content = f.read()
                     lines = content.split("\n")
                     filtered_lines = []
+                    in_main_block = False
 
                     for line in lines:
-                        if not line.strip() or not line.strip().startswith(
-                            ("import ", "from ")
-                        ):
-                            filtered_lines.append(line)
+                        stripped = line.strip()
+
+                        if stripped and not stripped.startswith(("import ", "from ")):
+                            if stripped == "if __name__ == '__main__':":
+                                in_main_block = True
+                                if chunk_name == "main":
+                                    filtered_lines.append(line)
+                            elif in_main_block:
+                                if chunk_name == "main":
+                                    filtered_lines.append(line)
+                            else:
+                                filtered_lines.append(line)
+
+                        if in_main_block and not stripped:
+                            if not any(
+                                next_line.startswith(" ")
+                                for next_line in lines[lines.index(line) + 1 :]
+                                if next_line.strip()
+                            ):
+                                in_main_block = False
 
                     module_content = "\n".join(filtered_lines)
 
@@ -280,6 +314,11 @@ def __load_chunk__(name):
         self.chunk_hashes[chunk_name] = chunk_hash
         hashed_filename = f"{chunk_name}.{chunk_hash}.py"
         output_path = self.output_dir / hashed_filename
+
+        if chunk_name != "main":
+            for module in modules:
+                if module in self.processed_files and module in module_to_chunk:
+                    self.processed_files.add((module, chunk_hash))
 
         os.makedirs(self.output_dir, exist_ok=True)
 
