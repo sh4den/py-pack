@@ -4,7 +4,7 @@ from pathlib import Path
 import json
 import hashlib
 import time
-from typing import Dict, Set, Tuple, List
+from typing import Dict, Set, Tuple, List, Optional
 
 from .Minifier import Minifier
 
@@ -128,7 +128,7 @@ class ChunkBuilder:
 
         return False
 
-    def _resolve_internal_module_path(self, module_name: str, current_module: Path) -> Path:
+    def _resolve_internal_module_path(self, module_name: str, current_module: Path) -> Optional[Path]:
         """
         Resolve an internal module name to its file path.
 
@@ -137,7 +137,7 @@ class ChunkBuilder:
             current_module (Path): Path of the current module being processed
 
         Returns:
-            Path: Resolved path to the module file, or None if not found
+            Optional[Path]: Resolved path to the module file, or None if not found
         """
         module_path = self.project_root / Path(module_name.replace(".", "/") + ".py")
         if module_path.exists():
@@ -208,7 +208,7 @@ def __load_chunk__(name):
         modules: Set[Path],
         sorted_modules: List[Path],
         module_to_chunk: Dict[Path, str],
-    ) -> Tuple[Path, str]:
+    ) -> Tuple[Optional[Path], Optional[str]]:
         """
         Build a chunk file containing multiple module contents.
 
@@ -219,7 +219,7 @@ def __load_chunk__(name):
             module_to_chunk (Dict[Path, str]): Mapping of modules to their chunks
 
         Returns:
-            Tuple[Path, str]: Tuple of (chunk output path, hashed filename)
+            Tuple[Optional[Path], Optional[str]]: Tuple of (chunk output path, hashed filename)
             Returns (None, None) if the chunk would be empty or contains no meaningful content
         """
         modules_in_sorted = [m for m in modules if m in sorted_modules]
@@ -299,13 +299,13 @@ def __load_chunk__(name):
                                 import_tracker["relative"].add(import_line)
                             else:
                                 if self._is_stdlib_module(node.module):
-                                    import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
+                                    import_line = f"from {node.module} import {', '.join([n.name for n in node.names])}"
                                     import_tracker["standard"].add(import_line)
                                 elif self._is_internal_module(node.module, module):
                                     # Skip internal imports - they will be bundled in this chunk
                                     continue
                                 else:
-                                    import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
+                                    import_line = f"from {node.module} import {', '.join([n.name for n in node.names])}"
                                     import_tracker["third_party"].add(import_line)
 
         chunk_code.extend(sorted(import_tracker["standard"]))

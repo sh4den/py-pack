@@ -2,7 +2,7 @@ import os
 import ast
 from pathlib import Path
 import re
-from typing import Dict, Set, List
+from typing import Dict, Set, List, Tuple
 import time
 from collections import defaultdict
 from termcolor import colored
@@ -27,6 +27,7 @@ class Packer:
             entry_point (str): Path to the main entry point Python file
             output_dir (str): Directory where bundled chunks will be output
         """
+        self.chunk_configs = None
         self.entry_point = Path(entry_point)
         self.output_dir = Path(output_dir)
         self.processed_files = set()
@@ -68,9 +69,10 @@ class Packer:
                     isinstance(node.func, ast.Attribute)
                     and node.func.attr == "import_module"
                 ):
-                    if node.args:
-                        if isinstance(node.args[0], ast.Str):
-                            dynamic_imports.append(node.args[0].s)
+                    if node.args and isinstance(node.args[0], ast.Constant):
+                        value = node.args[0].value
+                        if isinstance(value, str):
+                            dynamic_imports.append(value)
         return dynamic_imports
 
     def assign_modules_to_chunks(self):
@@ -169,7 +171,7 @@ class Packer:
             parts = dep.split(".")
             project_root = Path.cwd()
 
-            # Construct paths properly for multi-part module names
+            # Construct paths properly for multipart module names
             if len(parts) == 1:
                 # Single module name like 'os' or 'utils'
                 possible_paths = [
@@ -184,7 +186,7 @@ class Packer:
                     project_root / f"{parts[0]}.py",
                 ]
             else:
-                # Multi-part like 'utils.math_helpers' or 'models.user'
+                # Multipart like 'utils.math_helpers' or 'models.user'
                 # Try relative to current file first
                 relative_module = file_dir / Path(*parts[:-1]) / f"{parts[-1]}.py"
                 relative_package = file_dir / Path(*parts) / "__init__.py"
@@ -354,6 +356,12 @@ class Packer:
         self.process_file(self.entry_point)
         self.topological_sort()
 
+        # Calculate original size before compression
+        original_size = 0
+        for module in self.processed_files:
+            if module.exists():
+                original_size += os.path.getsize(module) / 1024
+
         # Put all modules in main chunk by default
         self.chunks["main"] = set(self.processed_files)
         for module in self.processed_files:
@@ -406,23 +414,39 @@ class Packer:
 
         build_time = time.time() - start_time
         print(colored("\n✨ Build completed successfully!", "green"))
-        print(colored("\nOutput files:", "white", attrs=["bold"]))
+        print(colored("\n📄  Output files:", "white", attrs=["bold"]))
 
         for name, filename, size in chunk_info:
             size_text = f"{size:.2f} KB"
             print(
-                f"  {colored('➜ ', 'green')} {filename.ljust(40)} {colored(size_text, 'yellow')}"
+                f"  {colored('➜', 'green')} {filename.ljust(40)} {colored(size_text, 'yellow')}"
+            )
+
+        # Calculate compression ratio
+        compression_ratio = ((original_size - total_size) / original_size * 100) if original_size > 0 else 0
+
+        # Format the statistics section with proper alignment matching output files
+        print(colored("\n📊  Compression Statistics:", "white", attrs=["bold"]))
+
+        # Use same column width as output files (40 characters)
+        column_width = 40
+
+        # Format each statistic line to match output files style
+        stats: List[Tuple[str, str, str]] = [
+            ("Original size:", f"{original_size:.2f} KB", "cyan"),
+            ("Compressed size:", f"{total_size:.2f} KB", "yellow"),
+            ("Compression:", f"{compression_ratio:.2f}%", "green"),
+            ("Build time:", f"{build_time:.2f}s", "yellow"),
+        ]
+
+        for label, value, color_name in stats:
+            attrs = ["bold"] if label == "Compression:" else []
+            print(
+                f"  {colored('➜', 'green')} {label.ljust(column_width)} {colored(value, color_name, attrs=attrs)}"
             )
 
         print(
-            colored("\nTotal size: ", "white", attrs=["bold"])
-            + colored(f"{total_size:.2f} KB", "yellow")
-        )
-        print(
-            colored("Build time: ", "white", attrs=["bold"])
-            + colored(f"{build_time:.2f}s", "yellow")
-        )
-        print(
-            colored("\nOutput directory: ", "white", attrs=["bold"])
-            + colored(str(self.output_dir), "blue")
+            colored("\n📁  Output directory:", "white", attrs=["bold"])
+            + " "
+            + colored(str(self.output_dir) + "/", "blue")
         )
