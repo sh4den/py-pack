@@ -84,7 +84,38 @@ class ChunkBuilder:
         Returns:
             bool: True if the module is internal to the project
         """
+        parts = module_name.split(".")
+        module_dir = current_module.parent
 
+        # Check relative to current file first (most common for project imports)
+        if len(parts) == 1:
+            # Single module name like 'utils'
+            if (module_dir / parts[0] / "__init__.py").exists():
+                return True
+            if (module_dir / f"{parts[0]}.py").exists():
+                return True
+            # Check parent directory for sibling packages
+            if (module_dir.parent / parts[0] / "__init__.py").exists():
+                return True
+            if (module_dir.parent / f"{parts[0]}.py").exists():
+                return True
+        else:
+            # Multi-part like 'utils.math_helpers'
+            relative_module = module_dir / Path(*parts[:-1]) / f"{parts[-1]}.py"
+            if relative_module.exists():
+                return True
+            relative_package = module_dir / Path(*parts) / "__init__.py"
+            if relative_package.exists():
+                return True
+            # Check parent directory for sibling packages
+            parent_module = module_dir.parent / Path(*parts[:-1]) / f"{parts[-1]}.py"
+            if parent_module.exists():
+                return True
+            parent_package = module_dir.parent / Path(*parts) / "__init__.py"
+            if parent_package.exists():
+                return True
+
+        # Check from project root
         module_path = self.project_root / Path(module_name.replace(".", "/") + ".py")
         if module_path.exists():
             return True
@@ -95,18 +126,41 @@ class ChunkBuilder:
         if package_init.exists():
             return True
 
+        return False
+
+    def _resolve_internal_module_path(self, module_name: str, current_module: Path) -> Path:
+        """
+        Resolve an internal module name to its file path.
+
+        Args:
+            module_name (str): The module name to resolve
+            current_module (Path): Path of the current module being processed
+
+        Returns:
+            Path: Resolved path to the module file, or None if not found
+        """
+        module_path = self.project_root / Path(module_name.replace(".", "/") + ".py")
+        if module_path.exists():
+            return module_path
+
+        package_init = (
+            self.project_root / Path(module_name.replace(".", "/")) / "__init__.py"
+        )
+        if package_init.exists():
+            return package_init
+
         module_dir = current_module.parent
         relative_module_path = module_dir / Path(module_name.replace(".", "/") + ".py")
         if relative_module_path.exists():
-            return True
+            return relative_module_path
 
         relative_package_init = (
             module_dir / Path(module_name.replace(".", "/")) / "__init__.py"
         )
         if relative_package_init.exists():
-            return True
+            return relative_package_init
 
-        return False
+        return None
 
     def _resolve_relative_import(
         self, current_module: Path, import_node: ast.ImportFrom
@@ -228,7 +282,10 @@ def __load_chunk__(name):
                                     import_line += f" as {name.asname}"
                                 if self._is_stdlib_module(name.name):
                                     import_tracker["standard"].add(import_line)
-                                elif not self._is_internal_module(name.name, module):
+                                elif self._is_internal_module(name.name, module):
+                                    # Skip internal imports - they will be bundled in this chunk
+                                    continue
+                                else:
                                     import_tracker["third_party"].add(import_line)
 
                         elif isinstance(node, ast.ImportFrom):
@@ -244,7 +301,10 @@ def __load_chunk__(name):
                                 if self._is_stdlib_module(node.module):
                                     import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
                                     import_tracker["standard"].add(import_line)
-                                elif not self._is_internal_module(node.module, module):
+                                elif self._is_internal_module(node.module, module):
+                                    # Skip internal imports - they will be bundled in this chunk
+                                    continue
+                                else:
                                     import_line = f"from {node.module} import {', '.join(n.name for n in node.names)}"
                                     import_tracker["third_party"].add(import_line)
 
@@ -261,8 +321,8 @@ def __load_chunk__(name):
                     chunk_code.append(f"__load_chunk__('{chunk_import}')")
 
         has_meaningful_content = False
-        for module in modules:
-            if module in sorted_modules:
+        for module in sorted_modules:  # Use sorted order instead of iterating through modules set
+            if module in modules:  # Only process if it's in this chunk
                 with open(module, "r") as f:
                     content = f.read()
                     lines = content.split("\n")

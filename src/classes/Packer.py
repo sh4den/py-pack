@@ -167,10 +167,42 @@ class Packer:
 
         for dep in dependencies:
             parts = dep.split(".")
-            possible_paths = [
-                file_dir / "/".join(parts) / "__init__.py",
-                file_dir / f"{'/'.join(parts)}.py",
-            ]
+            project_root = Path.cwd()
+
+            # Construct paths properly for multi-part module names
+            if len(parts) == 1:
+                # Single module name like 'os' or 'utils'
+                possible_paths = [
+                    # Try relative to current file first
+                    file_dir / parts[0] / "__init__.py",
+                    file_dir / f"{parts[0]}.py",
+                    # Try from parent directory (for sibling packages)
+                    file_dir.parent / parts[0] / "__init__.py",
+                    file_dir.parent / f"{parts[0]}.py",
+                    # Try from project root
+                    project_root / parts[0] / "__init__.py",
+                    project_root / f"{parts[0]}.py",
+                ]
+            else:
+                # Multi-part like 'utils.math_helpers' or 'models.user'
+                # Try relative to current file first
+                relative_module = file_dir / Path(*parts[:-1]) / f"{parts[-1]}.py"
+                relative_package = file_dir / Path(*parts) / "__init__.py"
+                # Try from parent directory (for sibling packages like utils.math_helpers when in services/)
+                parent_module = file_dir.parent / Path(*parts[:-1]) / f"{parts[-1]}.py"
+                parent_package = file_dir.parent / Path(*parts) / "__init__.py"
+                # Try from project root
+                module_file = project_root / Path(*parts[:-1]) / f"{parts[-1]}.py"
+                package_init = project_root / Path(*parts) / "__init__.py"
+
+                possible_paths = [
+                    relative_module,
+                    relative_package,
+                    parent_module,  # This will find example/utils/math_helpers.py from example/services/
+                    parent_package,
+                    module_file,
+                    package_init,
+                ]
 
             for path in possible_paths:
                 if path.exists():
@@ -313,14 +345,19 @@ class Packer:
 
         print(colored("\n🚀 Building chunks...", "cyan"))
 
-        if not hasattr(self, "chunk_configs") or not self.chunk_configs:
-            self.process_file(self.entry_point)
-            print(colored("  ➜  Auto-generating chunk configuration", "blue"))
-            self.auto_generate_chunks()
+        # Don't auto-generate chunks - we'll handle chunking based on size
+        # if not hasattr(self, "chunk_configs") or not self.chunk_configs:
+        #     self.process_file(self.entry_point)
+        #     print(colored("  ➜  Auto-generating chunk configuration", "blue"))
+        #     self.auto_generate_chunks()
 
         self.process_file(self.entry_point)
         self.topological_sort()
-        self.assign_modules_to_chunks()
+
+        # Put all modules in main chunk by default
+        self.chunks["main"] = set(self.processed_files)
+        for module in self.processed_files:
+            self.module_to_chunk[module] = "main"
 
         self.chunk_builder.processed_files = self.processed_files
 
