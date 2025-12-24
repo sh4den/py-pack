@@ -18,7 +18,7 @@ A webpack-like bundler for Python that splits code into optimized chunks.
 ## Installation
 
 ```bash
-git clone https://github.com/Inplex-sys/py-pack.git
+git clone https://github.com/sh4den/py-pack.git
 cd pypack
 pip install -e .
 ```
