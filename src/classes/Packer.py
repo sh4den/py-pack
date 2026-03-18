@@ -2,7 +2,7 @@ import os
 import ast
 from pathlib import Path
 import re
-from typing import Dict, Set, List, Tuple
+from typing import Dict, Set, List, Tuple, Optional, Iterable
 import time
 from collections import defaultdict
 from termcolor import colored
@@ -28,14 +28,103 @@ class Packer:
             output_dir (str): Directory where bundled chunks will be output
         """
         self.chunk_configs = None
-        self.entry_point = Path(entry_point)
-        self.output_dir = Path(output_dir)
+        self.entry_point = Path(entry_point).resolve()
+        self.output_dir = Path(output_dir).resolve()
+        self.project_root = self.entry_point.parent
         self.processed_files = set()
         self.dependencies = {}
         self.chunks: Dict[str, Set[Path]] = {}
         self.module_to_chunk: Dict[Path, str] = {}
         self.sorted_modules = []
-        self.chunk_builder = ChunkBuilder(output_dir)
+        self.chunk_builder = ChunkBuilder(str(self.output_dir), str(self.project_root))
+
+    def _unique_dirs(self, dirs: Iterable[Path]) -> List[Path]:
+        """Return directories with stable order and no duplicates."""
+        unique = []
+        seen = set()
+        for directory in dirs:
+            directory = directory.resolve()
+            if directory in seen:
+                continue
+            seen.add(directory)
+            unique.append(directory)
+        return unique
+
+    def _candidate_base_dirs(self, current_file: Path) -> List[Path]:
+        """Build lookup roots used to resolve imports from a file."""
+        file_dir = current_file.parent
+        return self._unique_dirs([file_dir, file_dir.parent, self.project_root])
+
+    def _resolve_dotted_module(self, module_name: str, base_dirs: Iterable[Path]) -> Optional[Path]:
+        """Resolve a dotted module name to a concrete .py or package __init__.py path."""
+        parts = module_name.split(".")
+        for base_dir in base_dirs:
+            module_file = base_dir.joinpath(*parts[:-1], f"{parts[-1]}.py")
+            if module_file.exists():
+                return module_file.resolve()
+
+            package_init = base_dir.joinpath(*parts, "__init__.py")
+            if package_init.exists():
+                return package_init.resolve()
+        return None
+
+    def _resolve_relative_base(self, current_file: Path, level: int) -> Path:
+        """Resolve the filesystem base directory for a relative import level."""
+        base = current_file.parent
+        for _ in range(max(level - 1, 0)):
+            base = base.parent
+        return base
+
+    def _resolve_import_from_node(self, current_file: Path, node: ast.ImportFrom) -> Set[Path]:
+        """Resolve all import targets referenced by an ImportFrom AST node."""
+        resolved = set()
+
+        if node.level > 0:
+            base_dir = self._resolve_relative_base(current_file, node.level)
+
+            if node.module:
+                resolved_module = self._resolve_dotted_module(node.module, [base_dir])
+                if resolved_module:
+                    resolved.add(resolved_module)
+
+                module_prefix = f"{node.module}."
+            else:
+                module_prefix = ""
+
+            for alias in node.names:
+                if alias.name == "*":
+                    continue
+                submodule = self._resolve_dotted_module(
+                    f"{module_prefix}{alias.name}",
+                    [base_dir],
+                )
+                if submodule:
+                    resolved.add(submodule)
+
+            return resolved
+
+        base_dirs = self._candidate_base_dirs(current_file)
+
+        if node.module:
+            resolved_module = self._resolve_dotted_module(node.module, base_dirs)
+            if resolved_module:
+                resolved.add(resolved_module)
+
+            module_prefix = f"{node.module}."
+        else:
+            module_prefix = ""
+
+        for alias in node.names:
+            if alias.name == "*":
+                continue
+            submodule = self._resolve_dotted_module(
+                f"{module_prefix}{alias.name}",
+                base_dirs,
+            )
+            if submodule:
+                resolved.add(submodule)
+
+        return resolved
 
     def configure_chunks(self, chunks: List[ChunkConfig]):
         """
@@ -143,6 +232,8 @@ class Packer:
         Args:
             file_path (Path): Path to the Python file to process
         """
+        file_path = file_path.resolve()
+
         if file_path in self.processed_files:
             return
 
@@ -155,61 +246,18 @@ class Packer:
             print(f"Warning: File not found: {file_path}")
             return
 
-        dependencies = set()
+        module_paths = set()
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for name in node.names:
-                    dependencies.add(name.name)
+                    resolved = self._resolve_dotted_module(
+                        name.name,
+                        self._candidate_base_dirs(file_path),
+                    )
+                    if resolved:
+                        module_paths.add(resolved)
             elif isinstance(node, ast.ImportFrom):
-                if node.module:
-                    dependencies.add(node.module)
-
-        file_dir = file_path.parent
-        module_paths = set()
-
-        for dep in dependencies:
-            parts = dep.split(".")
-            project_root = Path.cwd()
-
-            # Construct paths properly for multipart module names
-            if len(parts) == 1:
-                # Single module name like 'os' or 'utils'
-                possible_paths = [
-                    # Try relative to current file first
-                    file_dir / parts[0] / "__init__.py",
-                    file_dir / f"{parts[0]}.py",
-                    # Try from parent directory (for sibling packages)
-                    file_dir.parent / parts[0] / "__init__.py",
-                    file_dir.parent / f"{parts[0]}.py",
-                    # Try from project root
-                    project_root / parts[0] / "__init__.py",
-                    project_root / f"{parts[0]}.py",
-                ]
-            else:
-                # Multipart like 'utils.math_helpers' or 'models.user'
-                # Try relative to current file first
-                relative_module = file_dir / Path(*parts[:-1]) / f"{parts[-1]}.py"
-                relative_package = file_dir / Path(*parts) / "__init__.py"
-                # Try from parent directory (for sibling packages like utils.math_helpers when in services/)
-                parent_module = file_dir.parent / Path(*parts[:-1]) / f"{parts[-1]}.py"
-                parent_package = file_dir.parent / Path(*parts) / "__init__.py"
-                # Try from project root
-                module_file = project_root / Path(*parts[:-1]) / f"{parts[-1]}.py"
-                package_init = project_root / Path(*parts) / "__init__.py"
-
-                possible_paths = [
-                    relative_module,
-                    relative_package,
-                    parent_module,  # This will find example/utils/math_helpers.py from example/services/
-                    parent_package,
-                    module_file,
-                    package_init,
-                ]
-
-            for path in possible_paths:
-                if path.exists():
-                    module_paths.add(path)
-                    break
+                module_paths.update(self._resolve_import_from_node(file_path, node))
 
         self.dependencies[file_path] = module_paths
         for dep_path in module_paths:
