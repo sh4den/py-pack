@@ -1,0 +1,76 @@
+name: tests
+
+# Commits and merges landing on main, plus the pull requests aiming at it, so
+# a break is caught before it is merged rather than after.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: tests (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      # --frozen fails if uv.lock has drifted from pyproject.toml.
+      - name: Install dependencies
+        run: uv sync --frozen --python ${{ matrix.python }}
+
+      - name: Unit tests
+        run: uv run --python ${{ matrix.python }} python tests/test_internals.py
+
+      - name: Differential tests
+        run: uv run --python ${{ matrix.python }} python tests/test_bundles.py
+
+  bundle-compat:
+    name: bundles run on python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v9
+        with:
+          enable-cache: true
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      # The bundler needs 3.13+, but what it emits must keep working on the
+      # older interpreters the README promises. Build here, run there.
+      - name: Build a bundle
+        run: uv run python src/main.py example/app.py -o dist
+
+      - name: Record the unbundled output
+        run: uv run python example/app.py > expected.txt
+
+      # --no-project skips this project's requires-python, which the older
+      # interpreters below deliberately do not satisfy.
+      - name: Run the bundle and compare
+        run: |
+          bundle=$(ls dist/main.*.py)
+          uv run --python "${{ matrix.python }}" --no-project python "$bundle" > actual.txt
+          diff --unified expected.txt actual.txt

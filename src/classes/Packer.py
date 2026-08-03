@@ -1,500 +1,596 @@
-import os
 import ast
-from pathlib import Path
+import fnmatch
 import re
-from typing import Dict, Set, List, Tuple, Optional, Iterable
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+
 from termcolor import colored
 
-from .ChunkConfig import ChunkConfig
 from .ChunkBuilder import ChunkBuilder
+from .ChunkConfig import ChunkConfig
+from .Minifier import Minifier
+from .ModuleResolver import (
+    ImportScanner,
+    ModuleResolver,
+    SourceModule,
+    ancestors_of,
+    package_root_for,
+    read_source,
+)
 
 
 class Packer:
-    """
-    A module bundler that packs Python files into chunks based on their dependencies.
+    """Bundles a Python project into one or more self-contained chunks.
 
-    The Packer analyzes import dependencies, splits modules into configurable chunks,
-    and uses ChunkBuilder to generate the actual chunks and manifest file.
+    The packer walks the import graph from an entry point, embeds every
+    first-party module it reaches, and emits chunks that a small runtime
+    imports through ``sys.meta_path``. Module sources are never rewritten, so
+    the bundle behaves like the original project: relative imports, circular
+    imports, star imports, ``__all__``, ``global`` and modules sharing
+    top-level names all keep working.
+
+    Third-party and standard library imports are left alone and resolved
+    normally at runtime.
     """
 
-    def __init__(self, entry_point: str, output_dir: str):
+    def __init__(
+        self,
+        entry_point: str,
+        output_dir: str,
+        roots: Optional[Iterable[str]] = None,
+        include: Optional[Iterable[str]] = None,
+        minify: bool = True,
+        aggressive_minify: bool = False,
+        compress: bool = True,
+        quiet: bool = False,
+    ):
         """
-        Initialize a new Packer instance.
-
         Args:
-            entry_point (str): Path to the main entry point Python file
-            output_dir (str): Directory where bundled chunks will be output
+            entry_point: Path to the entry module, or to a package directory
+                containing a ``__main__.py``.
+            output_dir: Directory the chunks are written to.
+            roots: Extra source roots to resolve absolute imports against.
+                The entry point's own root is always included.
+            include: Dotted names or fnmatch patterns of modules to bundle
+                even though nothing imports them by a literal name. This is
+                the escape hatch for plugin registries and any other module
+                loaded under a name built at runtime.
+            minify: Whether to minify each bundled module.
+            aggressive_minify: Enable minifier transforms that are observable
+                at runtime (dropping annotations and docstrings).
+            compress: Store module sources deflated and base85-encoded. Set to
+                False to keep the chunks readable.
+            quiet: Suppress progress output.
         """
-        self.chunk_configs = None
-        self.entry_point = Path(entry_point).resolve()
+        self.entry_point = self._resolve_entry_point(entry_point)
         self.output_dir = Path(output_dir).resolve()
-        self.project_root = self.entry_point.parent
-        self.processed_files = set()
-        self.dependencies = {}
-        self.chunks: Dict[str, Set[Path]] = {}
-        self.module_to_chunk: Dict[Path, str] = {}
-        self.sorted_modules = []
-        self.chunk_builder = ChunkBuilder(str(self.output_dir), str(self.project_root))
+        self.include_patterns = list(include or ())
+        self.quiet = quiet
 
-    def _unique_dirs(self, dirs: Iterable[Path]) -> List[Path]:
-        """Return directories with stable order and no duplicates."""
-        unique = []
-        seen = set()
-        for directory in dirs:
-            directory = directory.resolve()
-            if directory in seen:
-                continue
-            seen.add(directory)
-            unique.append(directory)
-        return unique
+        source_root, entry_name = package_root_for(self.entry_point)
+        self.project_root = source_root
+        self.entry_module = entry_name
 
-    def _candidate_base_dirs(self, current_file: Path) -> List[Path]:
-        """Build lookup roots used to resolve imports from a file."""
-        file_dir = current_file.parent
-        return self._unique_dirs([file_dir, file_dir.parent, self.project_root])
+        self.resolver = ModuleResolver([source_root])
+        for root in roots or ():
+            self.resolver.add_root(root)
 
-    def _resolve_dotted_module(self, module_name: str, base_dirs: Iterable[Path]) -> Optional[Path]:
-        """Resolve a dotted module name to a concrete .py or package __init__.py path."""
-        parts = module_name.split(".")
-        for base_dir in base_dirs:
-            module_file = base_dir.joinpath(*parts[:-1], f"{parts[-1]}.py")
-            if module_file.exists():
-                return module_file.resolve()
+        self.scanner = ImportScanner()
+        self.minifier = Minifier(
+            enabled=minify, aggressive=aggressive_minify, quiet=quiet
+        )
+        self.chunk_builder = ChunkBuilder(
+            str(self.output_dir), self.minifier, compress=compress, quiet=quiet
+        )
 
-            package_init = base_dir.joinpath(*parts, "__init__.py")
-            if package_init.exists():
-                return package_init.resolve()
-        return None
+        self.chunk_configs: List[ChunkConfig] = []
 
-    def _resolve_relative_base(self, current_file: Path, level: int) -> Path:
-        """Resolve the filesystem base directory for a relative import level."""
-        base = current_file.parent
-        for _ in range(max(level - 1, 0)):
-            base = base.parent
-        return base
+        self.modules: Dict[str, SourceModule] = {}
+        self.module_dependencies: Dict[str, Set[str]] = {}
+        self.external_modules: Set[str] = set()
+        self.missing_modules: Set[str] = set()
+        self.computed_imports: List[Tuple[str, int, str]] = []
 
-    def _resolve_import_from_node(self, current_file: Path, node: ast.ImportFrom) -> Set[Path]:
-        """Resolve all import targets referenced by an ImportFrom AST node."""
-        resolved = set()
+        self.chunks: Dict[str, List[SourceModule]] = {}
+        self.module_to_chunk: Dict[str, str] = {}
+        self.sorted_modules: List[str] = []
 
-        if node.level > 0:
-            base_dir = self._resolve_relative_base(current_file, node.level)
 
-            if node.module:
-                resolved_module = self._resolve_dotted_module(node.module, [base_dir])
-                if resolved_module:
-                    resolved.add(resolved_module)
+    @staticmethod
+    def _resolve_entry_point(entry_point: str) -> Path:
+        """Resolve the entry point, accepting a package directory."""
+        path = Path(entry_point).resolve()
 
-                module_prefix = f"{node.module}."
-            else:
-                module_prefix = ""
-
-            for alias in node.names:
-                if alias.name == "*":
-                    continue
-                submodule = self._resolve_dotted_module(
-                    f"{module_prefix}{alias.name}",
-                    [base_dir],
-                )
-                if submodule:
-                    resolved.add(submodule)
-
-            return resolved
-
-        base_dirs = self._candidate_base_dirs(current_file)
-
-        if node.module:
-            resolved_module = self._resolve_dotted_module(node.module, base_dirs)
-            if resolved_module:
-                resolved.add(resolved_module)
-
-            module_prefix = f"{node.module}."
-        else:
-            module_prefix = ""
-
-        for alias in node.names:
-            if alias.name == "*":
-                continue
-            submodule = self._resolve_dotted_module(
-                f"{module_prefix}{alias.name}",
-                base_dirs,
+        if path.is_dir():
+            main = path / "__main__.py"
+            if main.is_file():
+                return main
+            raise FileNotFoundError(
+                f"{path} is a directory but has no __main__.py to use as an entry point"
             )
-            if submodule:
-                resolved.add(submodule)
 
-        return resolved
+        if not path.is_file():
+            raise FileNotFoundError(f"entry point not found: {path}")
 
-    def configure_chunks(self, chunks: List[ChunkConfig]):
-        """
-        Configure how modules should be split into chunks.
+        return path
 
-        Args:
-            chunks (List[ChunkConfig]): List of chunk configurations defining chunk names,
-                                      entry points and module include patterns
-        """
-        self.chunk_configs = chunks
+    def configure_chunks(self, chunks: List[ChunkConfig]) -> None:
+        """Configure how modules are split across chunks."""
+        self.chunk_configs = list(chunks)
 
-    def analyze_dynamic_imports(self, file_path: Path) -> List[str]:
-        """
-        Analyze a Python file for dynamic imports using __import__ or import_module.
+    def _log(self, message: str) -> None:
+        if not self.quiet:
+            print(message)
 
-        Args:
-            file_path (Path): Path to the Python file to analyze
 
-        Returns:
-            List[str]: List of dynamically imported module names
-        """
-        with open(file_path, "r") as f:
-            tree = ast.parse(f.read())
+    def _add_module(
+        self, name: str, path: Optional[Path], is_package: bool, source: str
+    ) -> SourceModule:
+        """Record a module in the graph."""
+        search_path = None
+        if is_package:
+            search_path = path.parent if path is not None else None
 
-        dynamic_imports = []
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Call):
-                if (
-                    isinstance(node.func, ast.Name) and node.func.id == "__import__"
-                ) or (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "import_module"
-                ):
-                    if node.args and isinstance(node.args[0], ast.Constant):
-                        value = node.args[0].value
-                        if isinstance(value, str):
-                            dynamic_imports.append(value)
-        return dynamic_imports
+        module = SourceModule(name, path, is_package, source, search_path)
+        self.modules[name] = module
+        return module
 
-    def assign_modules_to_chunks(self):
-        """
-        Assign all processed modules to their respective chunks based on chunk configs.
-
-        Modules are assigned to chunks based on:
-        1. Entry points defined in chunk configs
-        2. Include patterns matching module paths
-        3. Dependencies on other modules in chunks
-        4. Fallback to main chunk if no other assignment rules match
-        """
-        self.chunks["main"] = {self.entry_point}
-        self.module_to_chunk[self.entry_point] = "main"
-
-        for chunk_config in self.chunk_configs:
-            self.chunks[chunk_config.name] = set()
-
-            for entry in chunk_config.entry_points:
-                self.chunks[chunk_config.name].add(entry)
-                self.module_to_chunk[entry] = chunk_config.name
-
-            for include_pattern in chunk_config.includes:
-                for file in self.processed_files:
-                    if re.match(include_pattern, str(file)):
-                        self.chunks[chunk_config.name].add(file)
-                        self.module_to_chunk[file] = chunk_config.name
-
-        for module in self.processed_files:
-            if module not in self.module_to_chunk:
-                chunk_counts = {}
-                for dep in self.dependencies.get(module, []):
-                    if dep in self.module_to_chunk:
-                        chunk = self.module_to_chunk[dep]
-                        chunk_counts[chunk] = chunk_counts.get(chunk, 0) + 1
-
-                if chunk_counts:
-                    best_chunk = max(chunk_counts.items(), key=lambda x: x[1])[0]
-                    self.chunks[best_chunk].add(module)
-                    self.module_to_chunk[module] = best_chunk
-                else:
-                    self.chunks["main"].add(module)
-                    self.module_to_chunk[module] = "main"
-
-    def get_chunk_imports(self, chunk_name: str) -> Set[str]:
-        """
-        Get the set of other chunks that a chunk depends on.
+    def _require(self, name: str, queue: deque, required: bool) -> None:
+        """Pull a dotted name into the bundle if it is a first-party module.
 
         Args:
-            chunk_name (str): Name of the chunk to analyze
-
-        Returns:
-            Set[str]: Set of chunk names that this chunk imports from
+            name: Absolute dotted module name.
+            queue: Work queue of modules still to be scanned.
+            required: False for names that may well be attributes rather than
+                submodules, which must not be reported as missing.
         """
-        imports = set()
-        for module in self.chunks[chunk_name]:
-            for dep in self.dependencies.get(module, []):
-                if dep in self.module_to_chunk:
-                    dep_chunk = self.module_to_chunk[dep]
-                    if dep_chunk != chunk_name:
-                        imports.add(dep_chunk)
-        return imports
+        if not name or name in self.modules or name in self.external_modules:
+            return
+
+        resolved = self.resolver.resolve(name)
+
+        if resolved is None:
+            namespace = self.resolver.namespace_dir(name)
+            if namespace is not None:
+                module = self._add_module(name, None, True, "")
+                module.search_path = namespace
+                for parent in ancestors_of(name):
+                    self._require(parent, queue, required=False)
+                return
+
+            self.external_modules.add(name)
+            if required and self.resolver.has_native_extension(name):
+                self.missing_modules.add(name)
+            return
+
+        path, is_package = resolved
+        try:
+            source = read_source(path)
+        except OSError as error:
+            self._log(colored(f"  ! cannot read {path}: {error}", "yellow"))
+            self.external_modules.add(name)
+            return
+
+        module = self._add_module(name, path, is_package, source)
+        queue.append(module)
+
+        for parent in ancestors_of(name):
+            self._require(parent, queue, required=False)
+
+    def build_graph(self) -> None:
+        """Walk the import graph starting from the entry point."""
+        self.modules.clear()
+        self.module_dependencies.clear()
+        self.external_modules.clear()
+        self.missing_modules.clear()
+        self.computed_imports.clear()
+
+        source = read_source(self.entry_point)
+        is_package = self.entry_point.name == "__init__.py"
+        entry = self._add_module(
+            self.entry_module, self.entry_point, is_package, source
+        )
+
+        queue: deque = deque([entry])
+        for parent in ancestors_of(self.entry_module):
+            self._require(parent, queue, required=False)
+        self._apply_includes(queue)
+
+        while queue:
+            module = queue.popleft()
+            self.module_dependencies[module.name] = self._scan_module(module, queue)
+
+    def _apply_includes(self, queue: deque) -> None:
+        """Pull in the modules named by the explicit include patterns."""
+        if not self.include_patterns:
+            return
+
+        available = self.resolver.iter_module_names()
+        for pattern in self.include_patterns:
+            matched = [
+                name
+                for name in available
+                if name == pattern
+                or name.startswith(f"{pattern}.")
+                or fnmatch.fnmatchcase(name, pattern)
+            ]
+            if not matched:
+                self._log(
+                    colored(f"  ! nothing matches --include {pattern}", "yellow")
+                )
+            for name in matched:
+                self._require(name, queue, required=True)
+
+    def _scan_module(self, module: SourceModule, queue: deque) -> Set[str]:
+        """Parse a module and pull in everything it imports."""
+        try:
+            tree = ast.parse(module.source, filename=str(module.path or module.name))
+        except SyntaxError as error:
+            raise SyntaxError(
+                f"cannot parse {module.path or module.name}: {error}"
+            ) from error
+
+        required, speculative, computed = self.scanner.scan(tree, module.package)
+
+        for line, call in computed:
+            self.computed_imports.append((module.name, line, call))
+
+        for name in sorted(required):
+            for ancestor in ancestors_of(name):
+                self._require(ancestor, queue, required=False)
+            self._require(name, queue, required=True)
+
+        for name in sorted(speculative):
+            self._require(name, queue, required=False)
+
+        dependencies: Set[str] = set()
+        for name in required | speculative:
+            if name not in self.modules:
+                continue
+            dependencies.add(name)
+            dependencies.update(
+                parent for parent in ancestors_of(name) if parent in self.modules
+            )
+        return dependencies
 
     def process_file(self, file_path: Path) -> None:
+        """Add one more file, and its dependencies, to an existing graph.
+
+        Call it after :meth:`build_graph` to reach a module that no import
+        statement names, such as a plugin loaded from a computed string. The
+        ``include`` constructor argument does the same thing by pattern and is
+        usually easier.
         """
-        Process a Python file and recursively analyze its dependencies.
+        path = Path(file_path).resolve()
+        name = self.resolver.module_name_for(path)
+        if name is None:
+            root, name = package_root_for(path)
+            self.resolver.add_root(root)
 
-        Args:
-            file_path (Path): Path to the Python file to process
-        """
-        file_path = file_path.resolve()
-
-        if file_path in self.processed_files:
-            return
-
-        self.processed_files.add(file_path)
-
-        try:
-            with open(file_path, "r") as f:
-                tree = ast.parse(f.read())
-        except FileNotFoundError:
-            print(f"Warning: File not found: {file_path}")
-            return
-
-        module_paths = set()
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                for name in node.names:
-                    resolved = self._resolve_dotted_module(
-                        name.name,
-                        self._candidate_base_dirs(file_path),
-                    )
-                    if resolved:
-                        module_paths.add(resolved)
-            elif isinstance(node, ast.ImportFrom):
-                module_paths.update(self._resolve_import_from_node(file_path, node))
-
-        self.dependencies[file_path] = module_paths
-        for dep_path in module_paths:
-            self.process_file(dep_path)
+        queue: deque = deque()
+        self._require(name, queue, required=True)
+        while queue:
+            module = queue.popleft()
+            self.module_dependencies[module.name] = self._scan_module(module, queue)
 
     def topological_sort(self) -> None:
+        """Order modules so dependencies come first, tolerating cycles.
+
+        The order only makes the output deterministic and readable. Execution
+        order at runtime is decided by Python's import machinery, which is why
+        a dependency cycle is a warning here rather than an error.
         """
-        Sort modules based on their dependencies using depth-first search.
+        visited: Set[str] = set()
+        on_stack: Set[str] = set()
+        order: List[str] = []
+        cycles: Set[Tuple[str, str]] = set()
 
-        Detects circular dependencies and produces an ordering where dependencies
-        come before dependent modules.
+        def visit(name: str) -> None:
+            stack = [(name, iter(sorted(self.module_dependencies.get(name, ()))))]
+            on_stack.add(name)
+            visited.add(name)
 
-        Raises:
-            Exception: If a circular dependency is detected
-        """
-        visited = set()
-        temp_mark = set()
-        order = []
+            while stack:
+                current, children = stack[-1]
+                for child in children:
+                    if child in on_stack:
+                        cycles.add((current, child))
+                        continue
+                    if child in visited:
+                        continue
+                    visited.add(child)
+                    on_stack.add(child)
+                    stack.append(
+                        (child, iter(sorted(self.module_dependencies.get(child, ()))))
+                    )
+                    break
+                else:
+                    stack.pop()
+                    on_stack.discard(current)
+                    order.append(current)
 
-        def visit(node: Path):
-            if node in temp_mark:
-                raise Exception(f"Circular dependency detected involving {node}")
-            if node not in visited:
-                temp_mark.add(node)
-                for dep in self.dependencies.get(node, []):
-                    visit(dep)
-                temp_mark.remove(node)
-                visited.add(node)
-                order.append(node)
+        for name in sorted(self.modules):
+            if name not in visited:
+                visit(name)
 
-        for module in self.processed_files:
-            if module not in visited:
-                visit(module)
+        for source, target in sorted(cycles):
+            self._log(
+                colored(
+                    f"  ➜  circular import: {source} ↔ {target} (handled at runtime)",
+                    "blue",
+                )
+            )
 
         self.sorted_modules = order
 
-    def auto_generate_chunks(
-        self, min_chunk_size: int = 2, similarity_threshold: float = 0.5
-    ):
+
+    def _matches_include(self, module: SourceModule, pattern: str) -> bool:
+        """Match an include pattern against a module's path."""
+        if module.path is None:
+            return False
+
+        candidates = [str(module.path), module.path.as_posix()]
+        try:
+            candidates.append(module.path.relative_to(self.project_root).as_posix())
+        except ValueError:
+            pass
+
+        return any(re.search(pattern, candidate) for candidate in candidates)
+
+    def assign_modules_to_chunks(self) -> None:
+        """Split the graph into chunks according to the configuration.
+
+        The entry module always stays in ``main``; anything not claimed by a
+        chunk config joins it.
         """
-        Automatically generate chunk configurations based on module dependencies and patterns.
+        self.chunks = {"main": []}
+        self.module_to_chunk = {self.entry_module: "main"}
 
-        Args:
-            min_chunk_size (int): Minimum number of modules to form a chunk
-            similarity_threshold (float): Threshold for grouping modules (0.0 to 1.0)
+        for config in self.chunk_configs:
+            if config.name == "main":
+                continue
+            self.chunks.setdefault(config.name, [])
+
+            wanted: Set[str] = set()
+            for entry in config.entry_points:
+                path = entry if entry.is_absolute() else self.project_root / entry
+                name = self.resolver.module_name_for(path.resolve())
+                if name is None:
+                    self._log(
+                        colored(f"  ! chunk {config.name}: unknown file {entry}", "yellow")
+                    )
+                elif name not in self.modules:
+                    self._log(
+                        colored(
+                            f"  ! chunk {config.name}: {name} is not reachable from the entry point",
+                            "yellow",
+                        )
+                    )
+                else:
+                    wanted.add(name)
+
+            wanted.update(name for name in config.modules if name in self.modules)
+
+            for name, module in self.modules.items():
+                if any(self._matches_include(module, p) for p in config.includes):
+                    wanted.add(name)
+
+            for name in wanted:
+                if name not in self.module_to_chunk:
+                    self.module_to_chunk[name] = config.name
+
+        for name in self.modules:
+            self.module_to_chunk.setdefault(name, "main")
+
+        ordering = {name: index for index, name in enumerate(self.sorted_modules)}
+        for name, chunk_name in self.module_to_chunk.items():
+            self.chunks.setdefault(chunk_name, []).append(self.modules[name])
+        for modules in self.chunks.values():
+            modules.sort(key=lambda module: ordering.get(module.name, 0))
+
+    def get_chunk_imports(self, chunk_name: str) -> Set[str]:
+        """Return the chunks a chunk depends on."""
+        imports = set()
+        for module in self.chunks.get(chunk_name, []):
+            for dependency in self.module_dependencies.get(module.name, ()):
+                other = self.module_to_chunk.get(dependency)
+                if other and other != chunk_name:
+                    imports.add(other)
+        return imports
+
+    def auto_generate_chunks(self, min_chunk_size: int = 2) -> None:
+        """Derive one chunk per top-level package of the import graph.
+
+        Must be called after :meth:`build_graph`.
         """
-        dir_groups = defaultdict(set)
-        for module in self.processed_files:
-            dir_name = module.parent.name
-            dir_groups[dir_name].add(module)
+        groups: Dict[str, List[str]] = defaultdict(list)
+        for name in self.modules:
+            top_level = name.split(".")[0]
+            if top_level != self.entry_module.split(".")[0]:
+                groups[top_level].append(name)
 
-        auto_chunks = []
-        for dir_name, modules in dir_groups.items():
-            if len(modules) >= min_chunk_size:
-                chunk_config = ChunkConfig(
-                    name="chunk",
-                    entry_points=[next(iter(modules))],
-                    includes=[rf".*/{dir_name}/.*\.py"],
-                )
-                auto_chunks.append(chunk_config)
+        configs = [
+            ChunkConfig(name=top_level, modules=sorted(names))
+            for top_level, names in sorted(groups.items())
+            if len(names) >= min_chunk_size
+        ]
+        self.configure_chunks(configs)
 
-        dependency_groups = self._group_by_dependencies(similarity_threshold)
-        for group_idx, modules in enumerate(dependency_groups):
-            if len(modules) >= min_chunk_size:
-                chunk_config = ChunkConfig(
-                    name=f"chunk_deps_{group_idx}",
-                    entry_points=[next(iter(modules))],
-                    includes=[rf".*/{m.parent.name}/.*\.py" for m in modules],
-                )
-                auto_chunks.append(chunk_config)
 
-        self.configure_chunks(auto_chunks)
+    def pack(self) -> Dict[str, object]:
+        """Run the full build and write the chunks and manifest to disk."""
+        start_time = time.time()
+        self._log(colored("\n🚀 Building chunks...", "cyan"))
 
-    def _group_by_dependencies(self, similarity_threshold: float) -> List[Set[Path]]:
-        """
-        Group modules based on their dependency relationships.
+        if self.entry_module not in self.modules:
+            self.build_graph()
+        self.topological_sort()
+        self.assign_modules_to_chunks()
 
-        Args:
-            similarity_threshold (float): Threshold for considering modules similar
+        self.chunk_builder.chunk_files.clear()
+        self.chunk_builder.chunk_hashes.clear()
+        self.chunk_builder.source_bytes = 0
+        self.chunk_builder.runtime_bytes = 0
 
-        Returns:
-            List[Set[Path]]: List of module groups
-        """
-        groups = []
-        unassigned = set(self.processed_files)
+        original_size = sum(
+            len(module.source.encode("utf-8")) for module in self.modules.values()
+        )
 
-        while unassigned:
-            current = unassigned.pop()
-            current_group = {current}
+        order = [name for name in sorted(self.chunks) if name != "main"] + ["main"]
 
-            deps = self.dependencies.get(current, set())
-            dependents = {
-                m
-                for m in self.processed_files
-                if current in self.dependencies.get(m, set())
-            }
+        chunk_info: List[Tuple[str, str, float]] = []
+        total_size = 0
+        emitted: Dict[str, List[SourceModule]] = {}
 
-            for module in list(unassigned):
-                module_deps = self.dependencies.get(module, set())
-                module_dependents = {
-                    m
-                    for m in self.processed_files
-                    if module in self.dependencies.get(m, set())
+        for chunk_name in order:
+            modules = self.chunks.get(chunk_name, [])
+            is_entry_chunk = chunk_name == "main"
+
+            module_chunks = None
+            if is_entry_chunk:
+                module_chunks = {
+                    name: chunk
+                    for name, chunk in self.module_to_chunk.items()
+                    if chunk != "main"
                 }
 
-                deps_similarity = (
-                    len(deps & module_deps) / len(deps | module_deps)
-                    if deps or module_deps
-                    else 0
-                )
-
-                deps_flow_similarity = (
-                    len(dependents & module_dependents)
-                    / len(dependents | module_dependents)
-                    if dependents or module_dependents
-                    else 0
-                )
-
-                if (
-                    deps_similarity > similarity_threshold
-                    or deps_flow_similarity > similarity_threshold
-                ):
-                    current_group.add(module)
-                    unassigned.remove(module)
-
-            groups.append(current_group)
-
-        return groups
-
-    def pack(self):
-        """
-        Execute the complete packing process with auto-generated chunks if none configured.
-        """
-        start_time = time.time()
-
-        print(colored("\n🚀 Building chunks...", "cyan"))
-
-        # Don't auto-generate chunks - we'll handle chunking based on size
-        # if not hasattr(self, "chunk_configs") or not self.chunk_configs:
-        #     self.process_file(self.entry_point)
-        #     print(colored("  ➜  Auto-generating chunk configuration", "blue"))
-        #     self.auto_generate_chunks()
-
-        self.process_file(self.entry_point)
-        self.topological_sort()
-
-        # Calculate original size before compression
-        original_size = 0
-        for module in self.processed_files:
-            if module.exists():
-                original_size += os.path.getsize(module) / 1024
-
-        # Put all modules in main chunk by default
-        self.chunks["main"] = set(self.processed_files)
-        for module in self.processed_files:
-            self.module_to_chunk[module] = "main"
-
-        self.chunk_builder.processed_files = self.processed_files
-
-        chunk_info = []
-        total_size = 0
-        chunk_dependencies = {}
-        valid_chunks = {}
-        processed_modules = set()
-
-        chunk_processing_order = [name for name in self.chunks.keys() if name != "main"]
-
-        if "main" in self.chunks:
-            chunk_processing_order.append("main")
-
-        for chunk_name in chunk_processing_order:
-            if chunk_name not in self.chunks:
-                continue
-
-            modules = self.chunks[chunk_name]
-            chunk_dependencies[chunk_name] = self.get_chunk_imports(chunk_name)
-            chunk_path, hashed_filename = self.chunk_builder.build_chunk(
-                chunk_name, modules, self.sorted_modules, self.module_to_chunk
+            chunk_path, filename = self.chunk_builder.build_chunk(
+                chunk_name,
+                modules,
+                is_entry_chunk=is_entry_chunk,
+                entry_module=self.entry_module if is_entry_chunk else None,
+                module_chunks=module_chunks,
             )
-
             if chunk_path is None:
                 continue
 
-            valid_chunks[chunk_name] = modules
-            processed_modules.update(modules)
-
-            size = os.path.getsize(chunk_path) / 1024
+            emitted[chunk_name] = modules
+            size = chunk_path.stat().st_size
             total_size += size
-            chunk_info.append((chunk_name, hashed_filename, size))
+            chunk_info.append((chunk_name, filename, size / 1024))
 
-        valid_chunk_dependencies = {}
-        for chunk_name in valid_chunks:
-            valid_chunk_dependencies[chunk_name] = {
-                dep
-                for dep in chunk_dependencies.get(chunk_name, set())
-                if dep in valid_chunks
+        chunk_dependencies = {
+            chunk_name: {
+                dependency
+                for dependency in self.get_chunk_imports(chunk_name)
+                if dependency in emitted
             }
+            for chunk_name in emitted
+        }
 
         self.chunk_builder.generate_chunk_manifest(
-            valid_chunks, self.module_to_chunk, valid_chunk_dependencies
+            emitted, self.module_to_chunk, chunk_dependencies, self.entry_module
         )
 
         build_time = time.time() - start_time
+        self._report(chunk_info, original_size, total_size, build_time)
+
+        return {
+            "entry": self.entry_module,
+            "chunks": {name: filename for name, filename, _ in chunk_info},
+            "modules": len(self.modules),
+            "output_dir": self.output_dir,
+        }
+
+    def _report(
+        self,
+        chunk_info: List[Tuple[str, str, float]],
+        original_size: int,
+        total_size: int,
+        build_time: float,
+    ) -> None:
+        """Print the build summary."""
+        if self.quiet:
+            return
+
+        for name in sorted(self.missing_modules):
+            print(
+                colored(
+                    f"  ! {name} is a compiled extension and cannot be bundled; "
+                    "it must be installed where the bundle runs",
+                    "yellow",
+                )
+            )
+
+        if self.computed_imports:
+            print(
+                colored(
+                    "\n⚠️   Imports built at runtime, which cannot be traced:",
+                    "yellow",
+                    attrs=["bold"],
+                )
+            )
+            for module_name, line, call in self.computed_imports:
+                print(colored(f"  ! {module_name}:{line}  {call}", "yellow"))
+            print(
+                colored(
+                    "    Bundle the targets explicitly with include=[...] "
+                    "(--include on the command line).",
+                    "yellow",
+                )
+            )
+
         print(colored("\n✨ Build completed successfully!", "green"))
         print(colored("\n📄  Output files:", "white", attrs=["bold"]))
 
-        for name, filename, size in chunk_info:
+        for _, filename, size in chunk_info:
             size_text = f"{size:.2f} KB"
             print(
                 f"  {colored('➜', 'green')} {filename.ljust(40)} {colored(size_text, 'yellow')}"
             )
 
-        # Calculate compression ratio
-        compression_ratio = ((original_size - total_size) / original_size * 100) if original_size > 0 else 0
+        source_size = self.chunk_builder.source_bytes
+        runtime_size = self.chunk_builder.runtime_bytes
+        ratio = (
+            ((original_size - source_size) / original_size * 100)
+            if original_size
+            else 0.0
+        )
 
-        # Format the statistics section with proper alignment matching output files
-        print(colored("\n📊  Compression Statistics:", "white", attrs=["bold"]))
+        print(colored("\n📊  Statistics:", "white", attrs=["bold"]))
 
-        # Use same column width as output files (40 characters)
         column_width = 40
-
-        # Format each statistic line to match output files style
-        stats: List[Tuple[str, str, str]] = [
-            ("Original size:", f"{original_size:.2f} KB", "cyan"),
-            ("Compressed size:", f"{total_size:.2f} KB", "yellow"),
-            ("Compression:", f"{compression_ratio:.2f}%", "green"),
+        stats = [
+            ("Modules bundled:", str(len(self.modules)), "cyan"),
+            ("Original source:", f"{original_size / 1024:.2f} KB", "cyan"),
+            (
+                "Bundled source:",
+                f"{source_size / 1024:.2f} KB ({ratio:+.1f}%)",
+                "green",
+            ),
+            (
+                "On disk:",
+                f"{total_size / 1024:.2f} KB "
+                f"(incl. {runtime_size / 1024:.2f} KB runtime)",
+                "yellow",
+            ),
             ("Build time:", f"{build_time:.2f}s", "yellow"),
         ]
 
         for label, value, color_name in stats:
-            attrs = ["bold"] if label == "Compression:" else []
+            attrs = ["bold"] if label == "Bundled source:" else []
             print(
-                f"  {colored('➜', 'green')} {label.ljust(column_width)} {colored(value, color_name, attrs=attrs)}"
+                f"  {colored('➜', 'green')} {label.ljust(column_width)} "
+                f"{colored(value, color_name, attrs=attrs)}"
             )
+
+        external = sorted(self._external_roots())
+        if external:
+            print(colored("\n🔗  External imports (resolved at runtime):", "white", attrs=["bold"]))
+            print("  " + colored(", ".join(external), "blue"))
 
         print(
             colored("\n📁  Output directory:", "white", attrs=["bold"])
             + " "
             + colored(str(self.output_dir) + "/", "blue")
         )
+
+    def _external_roots(self) -> Set[str]:
+        """Top-level names of imports left for the runtime to resolve."""
+        return {
+            name.split(".")[0]
+            for name in self.external_modules
+            if name.split(".")[0] not in self.modules
+        }
